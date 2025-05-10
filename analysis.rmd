@@ -1,1 +1,843 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+
+```{r}
+# Install required packages (only run if not already installed)
+packages <- c(
+  "GEOquery", "limma", "illuminaHumanv4.db", "clusterProfiler", 
+  "org.Hs.eg.db", "dplyr", "org.Mm.eg.db", "ggplot2", 
+  "readr", "VennDiagram", "grid", "STRINGdb", "biomaRt", "tinytex"
+)
+
+install_if_missing <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+# Apply installation check
+invisible(sapply(packages, install_if_missing))
+
+# Load all packages
+library(GEOquery)
+library(limma)
+library(illuminaHumanv4.db)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(dplyr)
+library(org.Mm.eg.db)
+library(ggplot2)
+library(readr)
+library(VennDiagram)
+library(grid)
+library(STRINGdb)
+library(biomaRt)
+library(tinytex)
+
+# Optional: Install TinyTeX if not already installed (for PDF knitting)
+
+```
+
+
+```{r}
+# Load required packages
+library(GEOquery)
+library(limma)
+library(illuminaHumanv4.db)  # You may need a different annotation DB
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(dplyr)
+
+# Step 1: Load the GSE27334 dataset
+gse <- getGEO("GSE27334", GSEMatrix = TRUE)
+eset <- gse[[1]]
+
+# Step 2: Inspect the data
+n_samples <- ncol(exprs(eset))
+print(n_samples)  # Check sample count
+pheno <- pData(eset)
+head(pheno)
+
+# Step 3: Define the group factor
+# Adjust based on phenotype column name (check with colnames(pheno))
+table(pheno$`characteristics_ch1`)
+group <- factor(ifelse(pheno$source_name_ch1 == "non-treated P19.6 cells", "Control", "Treated"))
+table(group)
+
+
+
+# Step 4: Create design matrix
+# Create design matrix
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+# Step 5: Run differential expression analysis
+fit <- lmFit(eset, design)
+contrast.matrix <- makeContrasts(TreatedvsControl = Treated - Control, levels = design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+deg <- topTable(fit2, number = Inf, adjust = "fdr")
+
+fdata <- fData(eset)
+
+# Step 6: Annotate probe IDs (adjust if not illuminaHumanv4)
+deg$GB_ACC <- fdata[rownames(deg), "GB_ACC"]
+
+# Map GenBank accession to gene symbols
+deg$symbol <- mapIds(org.Mm.eg.db,
+                     keys = deg$GB_ACC,
+                     column = "SYMBOL",
+                     keytype = "ACCNUM",
+                     multiVals = "first")
+
+deg_clean <- deg[!is.na(deg$symbol), ]
+
+# Step 7: Group by gene symbol
+deg_gene <- deg_clean %>%
+  group_by(symbol) %>%
+  summarise(
+    logFC     = mean(logFC, na.rm = TRUE),
+    AveExpr   = mean(AveExpr, na.rm = TRUE),
+    t         = mean(t, na.rm = TRUE),
+    P.Value   = mean(P.Value, na.rm = TRUE),
+    adj.P.Val = mean(adj.P.Val, na.rm = TRUE),
+    B         = mean(B, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Step 8: Save DEGs
+deg_sig <- deg_gene[deg_gene$P.Value < 0.05 & abs(deg_gene$logFC) > 0.2, ]
+write.csv(deg_sig, "DEGs_GSE27334.csv")
+
+# Step 9: Functional enrichment (GO & KEGG)
+deg$entrez <- mapIds(org.Hs.eg.db,
+                     keys = deg$symbol,
+                     column = "ENTREZID",
+                     keytype = "SYMBOL",
+                     multiVals = "first")
+gene_list <- deg[deg$P.Value < 0.05 & abs(deg$logFC) > 0.2, ]
+entrez_ids <- na.omit(gene_list$entrez)
+
+# GO enrichment
+go <- enrichGO(gene         = entrez_ids,
+               OrgDb        = org.Hs.eg.db,
+               keyType      = "ENTREZID",
+               ont          = "BP",
+               pAdjustMethod = "fdr",
+               qvalueCutoff = 0.05)
+
+# KEGG enrichment
+kegg <- enrichKEGG(gene         = entrez_ids,
+                   organism     = 'hsa',
+                   pAdjustMethod = "fdr")
+
+# Plot
+dotplot(go, showCategory = 15, title = "GO Enrichment - BP")
+dotplot(kegg, showCategory = 15, title = "KEGG Pathway Enrichment")
+# Save GO enrichment plot
+go_plot <- dotplot(go, showCategory = 15, title = "GO Enrichment - BP")
+ggsave("GO_Enrichment_BP_GSE27334.png", plot = go_plot, width = 8, height = 6, dpi = 300)
+
+# Save KEGG enrichment plot
+kegg_plot <- dotplot(kegg, showCategory = 15, title = "KEGG Pathway Enrichment")
+ggsave("KEGG_Pathway_Enrichment_GSE27334.png", plot = kegg_plot, width = 8, height = 6, dpi = 300)
+
+```
+```{r}
+library(GEOquery)
+library(limma)
+library(dplyr)
+# Download GEO data
+gse <- getGEO("GSE68290", GSEMatrix = TRUE)
+eset <- gse[[1]]  # only one ExpressionSet
+
+# Metadata
+pheno <- pData(eset)
+
+# Subset ATRA 48h and EtOH control
+pheno_sub <- pheno[grepl("EtOH rep|ATRA 48h", pheno$source_name_ch1), ]
+eset_sub <- eset[, rownames(pheno_sub)]
+# Create group factor
+group <- factor(ifelse(grepl("ATRA 48h", pheno_sub$source_name_ch1), "ATRA_48h", "EtOH"))
+table(group)  # Should be 4 vs 1
+
+# Design matrix
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+# Fit linear model
+fit <- lmFit(eset_sub, design)
+
+# Define contrast
+contrast.matrix <- makeContrasts(ATRA_48h_vs_EtOH = ATRA_48h - EtOH, levels = design)
+
+# Fit contrast and compute eBayes
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+# Extract DEGs
+deg <- topTable(fit2, number = Inf, adjust = "fdr")
+head(deg)
+# Filter by p-value and logFC
+deg_sig <- deg[deg$P.Value < 0.05 & abs(deg$logFC) > 0.2, ]
+
+# Save to file
+write.csv(deg_sig, "DEGs_GSE68290_ATRA48h_vs_EtOH.csv")
+# View first 20 Entrez IDs with their corresponding gene symbols
+head(entrez_ids, 20)
+
+# Show how many unique Entrez IDs were mapped
+cat("Number of mapped Entrez IDs:", length(unique(entrez_ids)), "\n")
+
+
+
+# Print first few rows
+head(entrez_df, 20)
+
+# Optionally save to CSV
+write.csv(entrez_df, "Mapped_Entrez_IDs_GSE68290.csv", row.names = FALSE)
+
+```
+
+
+```{r}
+# Load required packages
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(ggplot2)
+
+# STEP 1: Read in the DEG file
+deg <- read.csv("DEGs_GSE68290_ATRA48h_vs_EtOH.csv", stringsAsFactors = FALSE)
+
+# STEP 2: Extract gene symbols from 'gene_assignment' column
+deg$SYMBOL <- sub(".*//\\s*([A-Za-z0-9\\-]+)\\s*//.*", "\\1", deg$gene_assignment)
+
+# Remove rows with invalid or missing gene symbols
+deg <- deg[!is.na(deg$SYMBOL) & deg$SYMBOL != "---" & deg$SYMBOL != "", ]
+
+# Optional: Filter DEGs by P-value and logFC
+deg_sig <- deg[deg$P.Value < 0.05 & abs(deg$logFC) > 0.2, ]
+
+# STEP 3: Map SYMBOL to Entrez ID
+entrez_ids <- mapIds(org.Mm.eg.db,
+                     keys = deg_sig$SYMBOL,
+                     column = "ENTREZID",
+                     keytype = "SYMBOL",
+                     multiVals = "first")
+
+# Remove NA mappings
+entrez_ids <- na.omit(entrez_ids)
+
+# STEP 4: GO enrichment (Biological Process)
+go <- enrichGO(gene         = entrez_ids,
+               OrgDb        = org.Mm.eg.db,
+               keyType      = "ENTREZID",
+               ont          = "BP",
+               pAdjustMethod = "fdr",
+               qvalueCutoff = 0.05)
+
+# Plot GO results
+dotplot(go, showCategory = 15, title = "GO Enrichment - Biological Process")
+
+# STEP 5: KEGG enrichment
+kegg <- enrichKEGG(gene         = entrez_ids,
+                   organism     = 'mmu',  # Mus musculus
+                   pAdjustMethod = "fdr")
+
+# Plot KEGG results
+dotplot(kegg, showCategory = 15, title = "KEGG Pathway Enrichment")
+
+
+```
+
+```{r}
+# Load packages
+library(GEOquery)
+library(limma)
+
+# Download and load dataset
+gse <- getGEO("GSE132903", GSEMatrix = TRUE)
+eset <- gse[[1]]
+
+# Check sample size
+n_samples <- ncol(exprs(eset))
+print(n_samples)  # should be 195
+
+# View metadata (phenotype/sample info)
+pheno <- pData(eset)
+head(pheno)
+
+# View expression matrix
+expr <- exprs(eset)
+dim(expr)  # genes x samples
+
+table(pheno$`characteristics_ch1.3`)
+# Define group vector (97 AD + 98 Control)
+group <- factor(ifelse(grepl("AD", pheno$`characteristics_ch1.3`), "AD", "ND"))
+table(group)
+
+print(length(group))  # also should be 195
+
+
+# Create design matrix
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+# Run limma differential expression
+fit <- lmFit(eset, design)
+contrast.matrix <- makeContrasts(ADvsND = AD - ND, levels = design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+deg <- topTable(fit2, number = Inf, adjust = "fdr")
+
+# View top DEGs
+head(deg)
+
+library(dplyr)
+
+# Annotate probe IDs to gene symbols
+deg$symbol <- mapIds(illuminaHumanv4.db, 
+                     keys = rownames(deg),
+                     column = "SYMBOL", 
+                     keytype = "PROBEID", 
+                     multiVals = "first")
+
+# Remove probes with NA gene symbols
+deg_clean <- deg[!is.na(deg$symbol), ]
+
+# Group by gene symbol and average all numeric columns
+deg_gene <- deg_clean %>%
+  group_by(symbol) %>%
+  summarise(
+    logFC     = mean(logFC, na.rm = TRUE),
+    AveExpr   = mean(AveExpr, na.rm = TRUE),
+    t         = mean(t, na.rm = TRUE),
+    P.Value   = mean(P.Value, na.rm = TRUE),
+    adj.P.Val = mean(adj.P.Val, na.rm = TRUE),
+    B         = mean(B, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Check the result for PLCB1
+deg_gene[deg_gene$symbol == "PLCB1", ]
+
+
+# Save DEGs
+deg_sig <- deg_gene[deg_gene$P.Value < 0.05 & abs(deg_gene$logFC) > 0.2, ]
+nrow(deg_sig)
+write.csv(deg_sig, "DEGs_GSE132903.csv")
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Step 1: Map probe IDs to gene symbols and ENTREZ IDs
+library(illuminaHumanv4.db)
+
+deg$symbol <- mapIds(illuminaHumanv4.db,
+                     keys = rownames(deg),
+                     column = "SYMBOL",
+                     keytype = "PROBEID",
+                     multiVals = "first")
+
+deg$entrez <- mapIds(org.Hs.eg.db,
+                     keys = deg$symbol,
+                     column = "ENTREZID",
+                     keytype = "SYMBOL",
+                     multiVals = "first")
+
+# Step 2: Select significant genes
+gene_list <- deg[deg$P.Value < 0.05 & abs(deg$logFC) > 0.2, ]
+entrez_ids <- na.omit(gene_list$entrez)
+
+# GO enrichment
+go <- enrichGO(gene         = entrez_ids,
+               OrgDb        = org.Hs.eg.db,
+               keyType      = "ENTREZID",
+               ont          = "BP", # Biological Process
+               pAdjustMethod = "fdr",
+               qvalueCutoff = 0.05)
+
+# Find GO terms related to "differentiation"
+diff_terms <- go@result[grep("differentiation", go@result$Description, ignore.case = TRUE), ]
+
+# Extract unique Entrez IDs from those GO terms
+diff_entrez_ids <- unique(unlist(strsplit(diff_terms$geneID, "/")))
+
+# Map back to gene symbols
+diff_gene_symbols <- bitr(
+  diff_entrez_ids,
+  fromType = "ENTREZID",
+  toType   = "SYMBOL",
+  OrgDb    = org.Hs.eg.db
+)
+
+# Output number and gene symbols
+cat("Number of genes involved in differentiation-related GO terms:\n")
+length(unique(diff_gene_symbols$SYMBOL))
+
+cat("\nGene symbols:\n")
+print(unique(diff_gene_symbols$SYMBOL))
+
+# KEGG enrichment
+kegg <- enrichKEGG(gene         = entrez_ids,
+                   organism     = 'hsa',
+                   pAdjustMethod = "fdr")
+
+# Plot GO
+dotplot(go, showCategory = 15, title = "GO Enrichment - Biological Process")
+
+# Plot KEGG
+dotplot(kegg, showCategory = 15, title = "KEGG Pathway Enrichment")
+
+```
+
+```{r}
+# Load files
+deg <- read.csv("DEGs_GSE68290_ATRA48h_vs_EtOH.csv", stringsAsFactors = FALSE)
+mapped <- read.csv("Mapped_Entrez_IDs_GSE68290.csv", stringsAsFactors = FALSE)
+
+# Extract SYMBOL from 'gene_assignment' (clean parsing)
+deg$SYMBOL <- sub(".*//\\s*([A-Za-z0-9\\-]+)\\s*//.*", "\\1", deg$gene_assignment)
+
+# Merge based on SYMBOL
+merged_data <- merge(deg, mapped, by = "SYMBOL", all.x = TRUE)
+
+# Preview
+head(merged_data)
+
+# Save merged file
+write.csv(merged_data, "Merged_DEGs_GSE68290.csv", row.names = FALSE)
+
+```
+
+```{r}
+# Load libraries
+library(readr)
+library(VennDiagram)
+library(grid)
+
+# Step 1: Load the datasets
+deg_27334 <- read_csv("DEGs_GSE27334.csv")
+deg_132903 <- read_csv("DEGs_GSE132903.csv")
+deg_68290 <- read_csv("Merged_DEGs_GSE68290.csv")
+
+# Step 2: Extract gene symbols (standardize to uppercase or lowercase)
+genes_27334 <- unique(tolower(deg_27334$symbol))    # Lowercase
+genes_132903 <- unique(tolower(deg_132903$symbol))
+genes_68290 <- unique(tolower(deg_68290$SYMBOL))
+
+# Remove NA or empty entries
+genes_27334 <- genes_27334[!is.na(genes_27334) & genes_27334 != ""]
+genes_132903 <- genes_132903[!is.na(genes_132903) & genes_132903 != ""]
+genes_68290 <- genes_68290[!is.na(genes_68290) & genes_68290 != ""]
+
+# Step 3: Find overlaps
+overlap_27334_132903 <- intersect(genes_27334, genes_132903)
+overlap_27334_68290 <- intersect(genes_27334, genes_68290)
+overlap_132903_68290 <- intersect(genes_132903, genes_68290)
+overlap_all_three <- Reduce(intersect, list(genes_27334, genes_132903, genes_68290))
+
+# Step 4: Print overlap results
+cat("Overlap between all three datasets:", length(overlap_all_three), "genes\n")
+head(overlap_all_three)
+
+# Optional: Save overlapping genes
+write.csv(overlap_all_three, "Overlapping_Genes_AllThree.csv", row.names = FALSE)
+
+# Step 5: Draw Venn Diagram
+venn.plot <- venn.diagram(
+  x = list(
+    GSE27334 = genes_27334,
+    GSE132903 = genes_132903,
+    GSE68290 = genes_68290
+  ),
+category.names = c("GSE27334 (Neural Differentiation)", 
+                   "GSE132903 (AD Brain)", 
+                   "GSE68290 (iPSC Neurons)"),
+
+  filename = NULL,
+  fill = c("lightblue", "pink", "lightgreen"),
+  alpha = 1,
+  cex = 1.5,
+  cat.cex = 1.2,
+  main = "Overlap of DEGs"
+)
+
+# Display the Venn Diagram
+grid.newpage()
+grid.draw(venn.plot)
+
+```
+```{r}
+# Load required libraries
+# Install if needed
+if (!requireNamespace("DOSE", quietly = TRUE)) {
+    BiocManager::install("DOSE")
+}
+library(DOSE)
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(readr)
+library(ggplot2)
+
+# Step 1: Load gene list and standardize
+overlap_genes <- read_csv("Overlapping_Genes_AllThree.csv", col_names = TRUE)
+symbols <- toupper(overlap_genes[[1]])
+
+# Step 2: Map to Entrez IDs
+entrez_ids <- mapIds(org.Hs.eg.db,
+                     keys = symbols,
+                     column = "ENTREZID",
+                     keytype = "SYMBOL",
+                     multiVals = "first")
+entrez_ids <- na.omit(entrez_ids)
+
+# Step 3: GO enrichment (Biological Process)
+go <- enrichGO(gene         = entrez_ids,
+               OrgDb        = org.Hs.eg.db,
+               keyType      = "ENTREZID",
+               ont          = "BP",
+               pAdjustMethod = "fdr",
+               qvalueCutoff = 0.05)
+
+# Step 4: KEGG pathway enrichment
+kegg <- enrichKEGG(gene         = entrez_ids,
+                   organism     = 'hsa',  # human
+                   pAdjustMethod = "fdr")
+# Step 4b: DO enrichment
+do <- enrichDO(gene          = entrez_ids,
+               pAdjustMethod = "fdr",
+               qvalueCutoff  = 0.2,
+               readable      = TRUE)
+
+
+# Step 5b: Plot DO with reduced font size
+dotplot(do, showCategory = 15, title = "DO Enrichment (Human)") +
+  theme(axis.text.y = element_text(size = 7))
+
+# Optional: Save DO output
+write.csv(as.data.frame(do), "DO_Human_Enrichment.csv", row.names = FALSE)
+
+# Step 5: Plot
+# Plot GO with reduced font size
+dotplot(go, showCategory = 15, title = "GO Enrichment - Biological Process (Human)") +
+  theme(axis.text.y = element_text(size = 7))
+
+# Plot KEGG with reduced font size
+dotplot(kegg, showCategory = 15, title = "KEGG Pathway Enrichment (Human)") +
+  theme(axis.text.y = element_text(size = 7))
+
+
+# Optional: Save outputs
+write.csv(as.data.frame(go), "GO_Human_Enrichment.csv", row.names = FALSE)
+write.csv(as.data.frame(kegg), "KEGG_Human_Enrichment.csv", row.names = FALSE)
+
+
+
+```
+
+```{r}
+# Load required packages
+library(STRINGdb)
+library(readr)
+library(biomaRt)
+library(dplyr)
+
+# Step 1: Load overlapping gene list and convert to uppercase
+overlap_genes <- read_csv("Overlapping_Genes_AllThree.csv", col_names = TRUE)
+symbols <- toupper(overlap_genes[[1]])  # STRING expects uppercase gene symbols
+
+# Step 2: Initialize STRINGdb for human
+string_db <- STRINGdb$new(version = "11.5", species = 9606, score_threshold = 400)
+
+# Step 3: Map symbols to STRING IDs
+gene_df <- data.frame(SYMBOL = symbols, stringsAsFactors = FALSE)
+mapped_genes <- string_db$map(gene_df, "SYMBOL", removeUnmappedRows = TRUE)
+
+# Step 4: Get interactions using STRING IDs
+ppi_network <- string_db$get_interactions(mapped_genes$STRING_id)
+
+# Step 5: Strip species prefix (9606.) from protein IDs
+ppi_network$from_short <- gsub("^9606\\.", "", ppi_network$from)
+ppi_network$to_short <- gsub("^9606\\.", "", ppi_network$to)
+
+# Step 6: Use biomaRt to map Ensembl protein IDs to gene symbols
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Query for both "from" and "to" IDs
+all_proteins <- unique(c(ppi_network$from_short, ppi_network$to_short))
+annotations <- getBM(
+  attributes = c("ensembl_peptide_id", "external_gene_name"),
+  filters = "ensembl_peptide_id",
+  values = all_proteins,
+  mart = mart
+)
+
+# Step 7: Merge gene names back into the PPI table
+ppi_annotated <- ppi_network %>%
+  left_join(annotations, by = c("from_short" = "ensembl_peptide_id")) %>%
+  rename(from_gene = external_gene_name) %>%
+  left_join(annotations, by = c("to_short" = "ensembl_peptide_id")) %>%
+  rename(to_gene = external_gene_name)
+
+# Step 8: Save final annotated PPI table
+write.csv(ppi_annotated, "Annotated_PPI_OverlappingGenes_Human.csv", row.names = FALSE)
+
+# View the first few rows
+head(ppi_annotated)
+
+```
+
+```{r}
+# Export GO results
+write.csv(as.data.frame(go), "GO_Enrichment_GSE27334.csv", row.names = FALSE)
+
+# Export KEGG results
+write.csv(as.data.frame(kegg), "KEGG_Enrichment_GSE27334.csv", row.names = FALSE)
+# Export GO results
+write.csv(as.data.frame(go), "GO_Enrichment_GSE68290.csv", row.names = FALSE)
+
+# Export KEGG results
+write.csv(as.data.frame(kegg), "KEGG_Enrichment_GSE68290.csv", row.names = FALSE)
+# Export GO results
+write.csv(as.data.frame(go), "GO_Enrichment_GSE132903.csv", row.names = FALSE)
+
+# Export KEGG results
+write.csv(as.data.frame(kegg), "KEGG_Enrichment_GSE132903.csv", row.names = FALSE)
+
+```
+
+```{r}
+# Load required packages
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(KEGGREST)
+library(dplyr)
+library(readr)
+
+# Step 1: Load overlapping gene symbols
+overlap_genes <- read_csv("Overlapping_Genes_AllThree.csv", col_names = FALSE)[[1]]
+overlap_genes <- toupper(overlap_genes)
+
+# Step 2: Map symbols to Entrez IDs
+entrez_ids <- mapIds(org.Hs.eg.db,
+                     keys = overlap_genes,
+                     column = "ENTREZID",
+                     keytype = "SYMBOL",
+                     multiVals = "first")
+entrez_ids <- na.omit(entrez_ids)
+
+# Step 3: Define target KEGG pathway IDs
+target_pathways <- c("hsa04720", "hsa04360", "hsa04068", "hsa04015")
+
+# Step 4: Get gene lists for each pathway from KEGG
+get_kegg_genes <- function(pathway_id) {
+  pathway_info <- keggGet(pathway_id)[[1]]
+  gene_info <- pathway_info$GENE
+  gene_symbols <- gene_info[seq(2, length(gene_info), 2)]  # even positions have gene symbols
+  gene_symbols <- gsub(";.*", "", gene_symbols)  # clean trailing annotations
+  data.frame(KEGG_Pathway = pathway_id, Gene = toupper(gene_symbols), stringsAsFactors = FALSE)
+}
+
+# Apply to all selected pathways
+kegg_gene_sets <- lapply(target_pathways, get_kegg_genes)
+kegg_df <- bind_rows(kegg_gene_sets)
+
+# Step 5: Find intersection with overlapping gene list
+overlap_results <- kegg_df %>%
+  filter(Gene %in% overlap_genes)
+
+# Step 6: Output
+print(overlap_results)
+write.csv(overlap_results, "Auto_Overlapping_Genes_with_KEGG.csv", row.names = FALSE)
+
+
+```
+
+```{r}
+# Load required packages
+library(readr)
+library(dplyr)
+library(igraph)
+
+# Step 1: Load the PPI data
+ppi <- read_csv("PPI_Overlapping_Genes_Human.csv")
+
+# Step 2: Load the KEGG gene list
+kegg_genes <- read_csv("Auto_Overlapping_Genes_with_KEGG.csv")
+
+# Step 3: Filter PPI to include only genes in the KEGG overlap list
+filtered_ppi <- ppi %>%
+  filter(!is.na(from_gene) & !is.na(to_gene)) %>%
+  filter(from_gene %in% kegg_genes$Gene & to_gene %in% kegg_genes$Gene)
+
+# Step 4: Create igraph object from filtered PPI
+g <- graph_from_data_frame(filtered_ppi, directed = FALSE)
+
+# Step 5: Calculate node degree (connectivity)
+deg <- degree(g, mode = "all")
+
+# Step 6: Get top hub proteins
+hub_df <- data.frame(Gene = names(deg), Degree = deg) %>%
+  arrange(desc(Degree))
+
+# Step 7: Output top hub genes
+print(head(hub_df, 10))  # Show top 10
+write.csv(hub_df, "Hub_Proteins_Filtered_KEGG.csv", row.names = FALSE)
+
+```
+
+```{r}
+# Load required packages
+library(readr)
+library(dplyr)
+library(igraph)
+
+# Step 1: Load the PPI network file
+ppi <- read_csv("Annotated_PPI_OverlappingGenes_Human.csv")
+
+# Step 2: Load the KEGG-overlapping gene list
+kegg_genes <- read_csv("Auto_Overlapping_Genes_with_KEGG.csv")
+
+# Step 3: Filter PPI network to include only those interactions where both genes are in KEGG gene list
+ppi_filtered <- ppi %>%
+  filter(!is.na(from_gene) & !is.na(to_gene)) %>%
+  filter(from_gene %in% kegg_genes$Gene & to_gene %in% kegg_genes$Gene)
+
+# Step 4: Build undirected graph from the filtered PPI
+g <- graph_from_data_frame(ppi_filtered[, c("from_gene", "to_gene")], directed = FALSE)
+
+# Step 5: Calculate node degrees (number of connections)
+deg <- degree(g, mode = "all")
+
+# Step 6: Identify and export top hub proteins
+hub_df <- data.frame(Gene = names(deg), Degree = deg) %>%
+  arrange(desc(Degree))
+
+# View top 10 hub proteins
+print(head(hub_df, 10))
+
+# Save the full ranked hub list
+write.csv(hub_df, "Filtered_KEGG_Hub_Proteins.csv", row.names = FALSE)
+
+```
+```{r}
+# Load required libraries
+
+library(readr)
+library(dplyr)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+library(ggplot2)
+
+# Step 1: Define top 10 hub genes
+top_hub_genes <- c("PLCG2", "MAP2K1", "GNAQ", "GSK3B", "FOXO1", 
+                   "MET", "PLCB1", "PIK3CB", "PPP3CA", "CCND1")
+
+# Step 2: Load the PPI network
+ppi <- read_csv("Annotated_PPI_OverlappingGenes_Human.csv")
+
+# Step 3: Filter interactions where both genes are in the top hub list
+ppi_sub <- ppi %>%
+  filter(!is.na(from_gene) & !is.na(to_gene)) %>%
+  filter(from_gene %in% top_hub_genes & to_gene %in% top_hub_genes) %>%
+  distinct(from_gene, to_gene)
+
+# Step 4: Build graph
+graph <- as_tbl_graph(ppi_sub, directed = FALSE)
+
+# Step 5: Plot with ggraph
+ggraph(graph, layout = "fr") + 
+  geom_edge_link(color = "gray60", alpha = 0.8) +
+  geom_node_point(size = 6, color = "steelblue") +
+  geom_node_text(aes(label = name), repel = TRUE, size = 4) +
+  theme_void() +
+  ggtitle("PPI Network of Top 10 Hub Genes")
+
+```
+```{r}
+library(readr)
+library(dplyr)
+
+# Load the PPI data
+ppi <- read_csv("Annotated_PPI_OverlappingGenes_Human.csv")
+
+# Remove NA genes
+ppi_clean <- ppi %>%
+  filter(!is.na(from_gene) & !is.na(to_gene))
+
+cat("Number of interactions after removing NA:", nrow(ppi_clean), "\n")
+
+# Remove duplicates
+ppi_clean_unique <- ppi_clean %>%
+  mutate(pair = ifelse(from_gene < to_gene,
+                       paste(from_gene, to_gene, sep = "_"),
+                       paste(to_gene, from_gene, sep = "_"))) %>%
+  distinct(pair, .keep_all = TRUE)
+
+cat("Number of interactions after removing duplicates:", nrow(ppi_clean_unique), "\n")
+
+# Calculate degree directly from PPI table
+all_genes <- c(ppi_clean_unique$from_gene, ppi_clean_unique$to_gene)
+degree_df <- as.data.frame(table(all_genes))
+colnames(degree_df) <- c("Gene", "Degree")
+
+# Check distribution
+print(degree_df)
+hist(degree_df$Degree, breaks = 20, main = "Degree Distribution", xlab = "Degree")
+
+# Filter genes based on degree
+threshold <- 10
+genes_to_keep <- degree_df %>%
+  filter(Degree >= threshold) %>%
+  pull(Gene)
+
+cat("Number of genes kept after filtering:", length(genes_to_keep), "\n")
+
+# Filter PPI interactions
+ppi_filtered <- ppi_clean_unique %>%
+  filter(from_gene %in% genes_to_keep & to_gene %in% genes_to_keep)
+
+cat("Number of interactions kept after filtering:", nrow(ppi_filtered), "\n")
+
+# Save result
+write.csv(ppi_filtered, "Filtered_PPI_HighConnectivity.csv", row.names = FALSE)
+cat("Filtered PPI network saved to 'Filtered_PPI_HighConnectivity.csv'\n")
+
+```
+```{r}
+library(readr)
+library(dplyr)
+
+# Step 1: Load the filtered PPI network
+ppi <- read_csv("Filtered_PPI_HighConnectivity.csv")
+
+# Step 2: Define list of genes to KEEP and their interactors
+genes_of_interest <- c(
+  "PLCG2", "MAP2K1", "GNAQ", "GSK3B", "FOXO1", "MET", "PLCB1", "PIK3CB", "PPP3CA", 
+  "CCND1", "ITPR1", "ITPR3", "PDGFRB", "EPHA4", "CALM1", "PLCE1", "ADCY8", 
+  "CCND2", "PLXNB1", "SEMA6C", "RPS6KA1"
+)
+
+# Step 3: Filter interactions
+ppi_filtered <- ppi %>%
+  filter(from_gene %in% genes_of_interest | to_gene %in% genes_of_interest)
+
+# Step 4: Save the result
+write.csv(ppi_filtered, "Filtered_PPI_GenesAndInteractors.csv", row.names = FALSE)
+
+# Summary
+cat("Number of interactions kept:", nrow(ppi_filtered), "\n")
+cat("Number of genes in final network:", length(unique(c(ppi_filtered$from_gene, ppi_filtered$to_gene))), "\n")
+
+```
+
+
+
 
